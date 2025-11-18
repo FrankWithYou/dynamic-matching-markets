@@ -238,11 +238,24 @@ Research Directions:
     print("=" * 70)
 
 if __name__ == "__main__":
-    # Quick demo: just policy comparison
-    print("Running policy comparison...")
-    print("(Edit uber_demo.py and uncomment main() for full demo)\n")
-    
-    compare_uber_policies(T=400, seed=42)
-    
-    # Full comprehensive demo:
+    # Run text-based comprehensive demo
     # main()
+    
+    # Run visualization-based analysis
+    print("UBER MARKET ANALYSIS WITH VISUALIZATIONS")
+    print("="*70)
+    print()
+    print("This generates comprehensive graphs and analysis.")
+    print("To use: import uber_analysis and run individual functions.")
+    print()
+    print("Quick example:")
+    print("  from uber_analysis import *")
+    print("  analyze_policy_comparison(T=400, seed=42, save_fig=True)")
+    print("  analyze_supply_demand(T=400, seed=42, save_fig=True)")
+    print("  analyze_location_models(T=400, seed=42, save_fig=True)")
+    print()
+    print("Or run: python uber_analysis.py")
+    print()
+    
+    # Quick policy comparison without full visualization
+    compare_uber_policies(T=400, seed=42)

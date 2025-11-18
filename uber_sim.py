@@ -92,25 +92,43 @@ class Driver:
         self.total_busy_time = 0
         self.total_distance_driven = 0
         
+        # New: keep track of when the current state started
+        self.last_state_change_time = arrival_time
+        
     def is_available(self, t):
         return t >= self.available_at and self.status == 'idle'
     
     def start_trip(self, t, rider, pickup_distance, trip_distance):
         """Start serving a rider."""
+        # We are leaving idle state at time t → accumulate idle time
+        if t > self.last_state_change_time:
+            self.total_idle_time += t - self.last_state_change_time
+        
         self.status = 'on_trip'
         self.current_rider_id = rider.id
         pickup_time = pickup_distance  # assume speed = 1 unit/time
         trip_time = trip_distance
         self.available_at = t + pickup_time + trip_time
         self.total_distance_driven += pickup_distance + trip_distance
+        
+        # We entered busy state at time t
+        self.last_state_change_time = t
+        
         return pickup_time, trip_time
     
     def complete_trip(self, t, dropoff_location):
         """Complete current trip and become idle at dropoff."""
+        # We are leaving busy state at time t → accumulate busy time
+        if t > self.last_state_change_time:
+            self.total_busy_time += t - self.last_state_change_time
+        
         self.status = 'idle'
         self.location = dropoff_location
         self.current_rider_id = None
         self.trips_completed += 1
+        
+        # Now idle from time t onward
+        self.last_state_change_time = t
 
 # ============================================================================
 # SPATIAL UTILITIES
@@ -258,7 +276,7 @@ def fcfs_match(riders, drivers, t, location_model=LocationModel.LINE_1D,
 
 def distance_aware_match(riders, drivers, t, location_model=LocationModel.LINE_1D,
                         distance_weight=0.5):
-    """Balance distance and urgency in matching."""
+    """Prioritize urgent riders, but still try to keep pickups short."""
     matches = []
     available_drivers = [d for d in drivers if d.is_available(t)]
     waiting_riders = [r for r in riders if not r.matched and not r.is_expired(t)]
@@ -266,22 +284,30 @@ def distance_aware_match(riders, drivers, t, location_model=LocationModel.LINE_1
     if not waiting_riders or not available_drivers:
         return matches
     
-    # Score-based matching
+    # More urgent riders first (smaller time_to_deadline → higher priority)
+    waiting_riders.sort(key=lambda r: r.time_until_deadline(t))
+    
     used_drivers = set()
     
     for rider in waiting_riders:
         best_driver = None
         best_score = float('inf')
+        best_distance = None
         
-        urgency = 1.0 / (rider.time_until_deadline(t) + 0.1)
+        # If you like, you can compute an urgency scalar; here we just use it
+        # inside the score so very urgent riders tolerate slightly longer pickups.
+        time_left = rider.time_until_deadline(t)
+        urgency = 1.0 / (time_left + 0.1)  # larger = more urgent
         
         for driver in available_drivers:
             if driver.id in used_drivers:
                 continue
             
             dist = distance(rider.location, driver.location, location_model)
-            # Lower score is better: weighted sum of distance and inverse urgency
-            score = distance_weight * dist + (1 - distance_weight) * (1.0 / (urgency + 0.1))
+            
+            # Lower score is better. As urgency rises, we downweight distance.
+            effective_weight = distance_weight / (1.0 + urgency)
+            score = effective_weight * dist
             
             if score < best_score:
                 best_score = score
@@ -320,6 +346,7 @@ def run_uber_simulation(
     location_bounds=10.0,
     policy=MatchingPolicy.GREEDY,
     matching_interval=0.5,  # how often to run matching
+    waiting_cost_per_unit=0.1,  # cost per unit time waiting (for welfare calculation)
     seed=None
 ):
     """
@@ -450,49 +477,82 @@ def run_uber_simulation(
             waiting_riders = [r for r in waiting_riders if r.id not in matched_ids]
     
     # Compute metrics
-    return compute_uber_metrics(all_riders, all_drivers, matches, T, location_model)
+    return compute_uber_metrics(all_riders, all_drivers, matches, T, location_model, 
+                               waiting_cost_per_unit=waiting_cost_per_unit)
 
-def compute_uber_metrics(riders, drivers, matches, T, location_model):
-    """Compute comprehensive metrics for Uber simulation."""
+def compute_uber_metrics(riders, drivers, matches, T, location_model, waiting_cost_per_unit=0.1):
+    """Compute comprehensive metrics for Uber simulation.
+    
+    Metrics follow the user's specification:
+    - Match rate = matched / total agents
+    - Average wait for matched agents only
+    - Welfare: base value 1 per match minus waiting_cost × wait
+    """
     matched_riders = [r for r in riders if r.matched]
     unmatched_riders = [r for r in riders if not r.matched]
     
+    # Core metrics
+    total_agents = len(riders)
+    matched_agents = len(matched_riders)
+    match_rate = matched_agents / total_agents if total_agents > 0 else 0
+    
+    # Wait time (for matched agents only)
+    if matched_riders:
+        wait_times = [r.wait_time() for r in matched_riders]
+        avg_wait = np.mean(wait_times)
+    else:
+        avg_wait = 0
+    
+    # Welfare: 1 per match minus waiting_cost × average_wait
+    welfare = matched_agents - (waiting_cost_per_unit * avg_wait * matched_agents)
+    
     metrics = {
-        'total_riders': len(riders),
-        'total_drivers': len(drivers),
-        'matched_riders': len(matched_riders),
+        # Core user-specified metrics
+        'total_riders': total_agents,
+        'matched_riders': matched_agents,
         'unmatched_riders': len(unmatched_riders),
-        'rider_match_rate': len(matched_riders) / len(riders) if riders else 0,
+        'rider_match_rate': match_rate,
+        'avg_rider_wait': avg_wait,
+        'welfare': welfare,
+        
+        # Additional useful metrics
+        'total_drivers': len(drivers),
+        'supply_demand_ratio': len(drivers) / len(riders) if riders else 0,
     }
     
-    # Rider metrics
+    # Pickup distance (for matched riders only)
     if matched_riders:
-        metrics['avg_rider_wait'] = np.mean([r.wait_time() for r in matched_riders])
         metrics['avg_pickup_distance'] = np.mean([r.pickup_distance for r in matched_riders])
         metrics['avg_pickup_time'] = np.mean([r.pickup_time for r in matched_riders])
         metrics['avg_trip_distance'] = np.mean([r.trip_distance for r in matched_riders])
     else:
-        metrics['avg_rider_wait'] = 0
         metrics['avg_pickup_distance'] = 0
         metrics['avg_pickup_time'] = 0
         metrics['avg_trip_distance'] = 0
     
     # Driver metrics
     if drivers:
+        # Finish each driver's timeline up to horizon T
+        for d in drivers:
+            if d.last_state_change_time < T:
+                if d.status in ('on_trip', 'picking_up'):
+                    d.total_busy_time += T - d.last_state_change_time
+                else:  # idle
+                    d.total_idle_time += T - d.last_state_change_time
+        
         metrics['avg_trips_per_driver'] = np.mean([d.trips_completed for d in drivers])
         metrics['avg_driver_distance'] = np.mean([d.total_distance_driven for d in drivers])
         
-        # Driver utilization
-        total_possible_time = sum(T - d.arrival_time for d in drivers)
-        total_busy_time = sum(max(0, d.available_at - d.arrival_time) for d in drivers)
-        metrics['driver_utilization'] = total_busy_time / total_possible_time if total_possible_time > 0 else 0
+        # True utilization = fraction of time actually busy
+        total_possible_time = sum(max(0, T - d.arrival_time) for d in drivers)
+        total_busy_time = sum(d.total_busy_time for d in drivers)
+        metrics['driver_utilization'] = (
+            total_busy_time / total_possible_time if total_possible_time > 0 else 0
+        )
     else:
         metrics['avg_trips_per_driver'] = 0
         metrics['avg_driver_distance'] = 0
         metrics['driver_utilization'] = 0
-    
-    # Supply-demand balance
-    metrics['supply_demand_ratio'] = len(drivers) / len(riders) if riders else 0
     
     return metrics
 
