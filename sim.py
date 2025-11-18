@@ -138,12 +138,41 @@ def greedy_match(waiting, t, compatibility_matrix=None):
     return matched_pairs, [a for i,a in enumerate(waiting) if i not in used]
 
 def patient_match(waiting, t, compatibility_matrix=None):
+    """Patient matching: expiring agents match with full pool.
+    
+    Following Akbarpour-Li-Oveis Gharan: when an agent becomes critical,
+    match them with anyone compatible in the full waiting pool, not just
+    other expiring agents.
+    """
     expiring = [a for a in waiting if a.deadline <= t]
     stay = [a for a in waiting if a.deadline > t]
-    pairs, _ = greedy_match(expiring, t, compatibility_matrix)
-    matched_ids = {a.id for (a,b,_) in pairs} | {b.id for (a,b,_) in pairs}
-    # agents whose deadline reached but unmatched leave
-    remaining = stay + [a for a in expiring if a.id in matched_ids]
+    
+    if not expiring:
+        return [], waiting
+    
+    pairs = []
+    used_ids = set()
+    pool = stay + expiring
+    
+    # For each expiring agent, try to match with anyone in the full pool
+    for a in expiring:
+        if a.id in used_ids:
+            continue
+        for b in pool:
+            if b.id in used_ids or b.id == a.id:
+                continue
+            if are_compatible(a, b, compatibility_matrix=compatibility_matrix):
+                # Mark both matched
+                a.matched = b.matched = True
+                a.match_time = b.match_time = t
+                a.partner_id, b.partner_id = b.id, a.id
+                used_ids.add(a.id)
+                used_ids.add(b.id)
+                pairs.append((a, b, t))
+                break
+    
+    # Return unmatched agents who haven't expired
+    remaining = [x for x in pool if x.id not in used_ids and not x.is_expired(t)]
     return pairs, remaining
 
 def patient_alpha_match(waiting, t, alpha=0.3, compatibility_matrix=None):
@@ -305,7 +334,50 @@ def run_simulation(T=100, arrival_rate=1.0, easy_fraction=0.7,
         "by_type": metrics_by_type
     }
 
-def run_baseline_comparisons(T=200, seed=0, verbose=True, include_urgency=False):
+def run_simulation_averaged(n_seeds=10, **kwargs):
+    """Run simulation multiple times and average results.
+    
+    Args:
+        n_seeds: Number of random seeds to average over
+        **kwargs: Parameters for run_simulation
+    
+    Returns:
+        dict with averaged metrics and std deviations
+    """
+    results_list = []
+    base_seed = kwargs.get('seed', 0)
+    
+    for i in range(n_seeds):
+        kwargs['seed'] = base_seed + i if base_seed is not None else None
+        results_list.append(run_simulation(**kwargs))
+    
+    # Average metrics
+    averaged = {
+        'match_rate': np.mean([r['match_rate'] for r in results_list]),
+        'match_rate_std': np.std([r['match_rate'] for r in results_list]),
+        'avg_wait': np.mean([r['avg_wait'] for r in results_list]),
+        'avg_wait_std': np.std([r['avg_wait'] for r in results_list]),
+        'welfare': np.mean([r['welfare'] for r in results_list]),
+        'welfare_std': np.std([r['welfare'] for r in results_list]),
+        'n_seeds': n_seeds
+    }
+    
+    # Average by-type metrics if present
+    if results_list[0]['by_type']:
+        averaged['by_type'] = {}
+        for agent_type in results_list[0]['by_type'].keys():
+            averaged['by_type'][agent_type] = {
+                'match_rate': np.mean([r['by_type'][agent_type]['match_rate'] 
+                                      for r in results_list if agent_type in r['by_type']]),
+                'avg_wait': np.mean([r['by_type'][agent_type]['avg_wait'] 
+                                    for r in results_list if agent_type in r['by_type']]),
+                'expired_unmatched_rate': np.mean([r['by_type'][agent_type]['expired_unmatched_rate'] 
+                                                  for r in results_list if agent_type in r['by_type']])
+            }
+    
+    return averaged
+
+def run_baseline_comparisons(T=200, seed=0, verbose=True, include_urgency=False, n_seeds=1):
     """Compare all policies on homogeneous and imbalanced markets."""
     results = {}
     
@@ -313,29 +385,52 @@ def run_baseline_comparisons(T=200, seed=0, verbose=True, include_urgency=False)
     if include_urgency:
         policies.extend([Policy.URGENCY_AWARE, Policy.ADAPTIVE_ALPHA])
     
+    if n_seeds > 1 and verbose:
+        print(f"(Averaging over {n_seeds} runs)")
+    
     if verbose:
         print("=== Homogeneous market (easy=0.9) ===")
     results['homogeneous'] = {}
     for policy in policies:
-        res = run_simulation(T=T, easy_fraction=0.9, policy=policy, seed=seed)
+        if n_seeds > 1:
+            res = run_simulation_averaged(n_seeds=n_seeds, T=T, easy_fraction=0.9, 
+                                         policy=policy, seed=seed)
+        else:
+            res = run_simulation(T=T, easy_fraction=0.9, policy=policy, seed=seed)
         results['homogeneous'][policy.name] = res
         if verbose:
             print(f"{policy.name}:")
-            print(f"  Overall - Match rate: {res['match_rate']:.3f}, Avg wait: {res['avg_wait']:.2f}, Welfare: {res['welfare']:.1f}")
-            for agent_type, metrics in res['by_type'].items():
-                print(f"  {agent_type.capitalize()} - Match rate: {metrics['match_rate']:.3f}, Avg wait: {metrics['avg_wait']:.2f}")
+            if n_seeds > 1:
+                print(f"  Match rate: {res['match_rate']:.3f} ± {res['match_rate_std']:.3f}")
+                print(f"  Avg wait: {res['avg_wait']:.2f} ± {res['avg_wait_std']:.2f}")
+                print(f"  Welfare: {res['welfare']:.1f} ± {res['welfare_std']:.1f}")
+            else:
+                print(f"  Match rate: {res['match_rate']:.3f}, Avg wait: {res['avg_wait']:.2f}, Welfare: {res['welfare']:.1f}")
+                for agent_type, metrics in res['by_type'].items():
+                    print(f"  {agent_type.capitalize()} - Match: {metrics['match_rate']:.3f}, "
+                          f"Wait: {metrics['avg_wait']:.2f}, Expired: {metrics['expired_unmatched_rate']:.3f}")
 
     if verbose:
         print("\n=== Imbalanced market (easy=0.3) ===")
     results['imbalanced'] = {}
     for policy in policies:
-        res = run_simulation(T=T, easy_fraction=0.3, policy=policy, seed=seed)
+        if n_seeds > 1:
+            res = run_simulation_averaged(n_seeds=n_seeds, T=T, easy_fraction=0.3, 
+                                         policy=policy, seed=seed)
+        else:
+            res = run_simulation(T=T, easy_fraction=0.3, policy=policy, seed=seed)
         results['imbalanced'][policy.name] = res
         if verbose:
             print(f"{policy.name}:")
-            print(f"  Overall - Match rate: {res['match_rate']:.3f}, Avg wait: {res['avg_wait']:.2f}, Welfare: {res['welfare']:.1f}")
-            for agent_type, metrics in res['by_type'].items():
-                print(f"  {agent_type.capitalize()} - Match rate: {metrics['match_rate']:.3f}, Avg wait: {metrics['avg_wait']:.2f}")
+            if n_seeds > 1:
+                print(f"  Match rate: {res['match_rate']:.3f} ± {res['match_rate_std']:.3f}")
+                print(f"  Avg wait: {res['avg_wait']:.2f} ± {res['avg_wait_std']:.2f}")
+                print(f"  Welfare: {res['welfare']:.1f} ± {res['welfare_std']:.1f}")
+            else:
+                print(f"  Match rate: {res['match_rate']:.3f}, Avg wait: {res['avg_wait']:.2f}, Welfare: {res['welfare']:.1f}")
+                for agent_type, metrics in res['by_type'].items():
+                    print(f"  {agent_type.capitalize()} - Match: {metrics['match_rate']:.3f}, "
+                          f"Wait: {metrics['avg_wait']:.2f}, Expired: {metrics['expired_unmatched_rate']:.3f}")
     
     return results
 
